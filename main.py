@@ -1,338 +1,486 @@
-"""
-Main entry point for Telegram IVASMS OTP Bot.
-Full-featured version with background monitoring thread.
-"""
-
 import os
+import asyncio
 import logging
+from datetime import datetime, timedelta
+from flask import Flask, jsonify, request, render_template
+from dotenv import load_dotenv
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from scraper import create_scraper
+from otp_filter import otp_filter
+from utils import format_otp_message, format_multiple_otps, get_status_message
 import threading
 import time
-from datetime import datetime
-from flask import Flask, jsonify, render_template_string
 
-# ---------------------------
-# Attempt to import actual modules
-# ---------------------------
-try:
-    from scraper import IVASMSScraper
-    from telegram_bot import TelegramBot
-    from utils import setup_logging
-    ACTUAL_MODULES = True
-except ImportError as e:
-    print(f"⚠️ Warning: Could not import actual modules: {e}")
-    print("Using dummy classes for testing. Replace with real implementations.")
-    ACTUAL_MODULES = False
-    
-    # Dummy classes for fallback
-    class IVASMSScraper:
-        def __init__(self, username, password):
-            self.username = username
-            self.password = password
-        def login(self):
-            print(f"Dummy login with {self.username}")
-            return True
-        def check_otp(self):
-            # Return dummy OTP for testing
-            return [{"otp": "123456", "number": "+1234567890", "service": "Test"}]
-    
-    class TelegramBot:
-        def __init__(self, token, chat_id):
-            self.token = token
-            self.chat_id = chat_id
-        def send_otp(self, otp_data):
-            print(f"Dummy send OTP: {otp_data}")
-            return True
+# Load environment variables
+load_dotenv()
 
-# ---------------------------
-# Logging Configuration
-# ---------------------------
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------
-# Environment Variables
-# ---------------------------
-IVASMS_USERNAME = os.environ.get('IVASMS_USERNAME')
-IVASMS_PASSWORD = os.environ.get('IVASMS_PASSWORD')
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-
-missing_vars = []
-if not IVASMS_USERNAME: missing_vars.append('IVASMS_USERNAME')
-if not IVASMS_PASSWORD: missing_vars.append('IVASMS_PASSWORD')
-if not TELEGRAM_BOT_TOKEN: missing_vars.append('TELEGRAM_BOT_TOKEN')
-if not TELEGRAM_CHAT_ID: missing_vars.append('TELEGRAM_CHAT_ID')
-
-if missing_vars:
-    logger.error(f"Missing environment variables: {', '.join(missing_vars)}. Bot will run in limited mode.")
-else:
-    logger.info("All environment variables loaded.")
-
-# ---------------------------
-# Global State
-# ---------------------------
-scraper = None
-telegram_bot = None
-otp_sent_count = 0
-last_check_time = None
-monitoring_active = False
-
-if not missing_vars:
-    try:
-        scraper = IVASMSScraper(IVASMS_USERNAME, IVASMS_PASSWORD)
-        telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        logger.info("✅ Scraper and Telegram bot initialized.")
-        monitoring_active = True
-    except Exception as e:
-        logger.exception("Failed to initialize scraper or bot:")
-        monitoring_active = False
-else:
-    monitoring_active = False
-
-# ---------------------------
-# Background Monitoring Thread
-# ---------------------------
-def monitoring_loop():
-    """Main monitoring loop – runs every 60 seconds."""
-    global otp_sent_count, last_check_time
-    logger.info("🚀 Monitoring thread started.")
-    while True:
-        try:
-            if not monitoring_active or not scraper or not telegram_bot:
-                logger.warning("Monitoring not active or components missing. Skipping cycle.")
-                time.sleep(60)
-                continue
-
-            # Ensure logged in (re-login if needed)
-            if not scraper.login():
-                logger.error("IVASMS login failed. Will retry in 60 seconds.")
-                time.sleep(60)
-                continue
-
-            # Check for new OTPs
-            otps = scraper.check_otp()
-            logger.info(f"Checked OTPs, found {len(otps)} new.")
-            
-            for otp in otps:
-                success = telegram_bot.send_otp(otp)
-                if success:
-                    otp_sent_count += 1
-                    logger.info(f"OTP sent: {otp}")
-                else:
-                    logger.error(f"Failed to send OTP: {otp}")
-
-            last_check_time = datetime.now().isoformat()
-
-        except Exception as e:
-            logger.exception("Error in monitoring loop:")
-        
-        time.sleep(60)  # Wait 1 minute before next check
-
-# Start monitoring thread if conditions are met
-if monitoring_active:
-    monitor_thread = threading.Thread(target=monitoring_loop, daemon=True)
-    monitor_thread.start()
-    logger.info("✅ Monitoring thread spawned.")
-else:
-    logger.warning("⚠️ Monitoring thread not started due to missing configuration or initialization failure.")
-
-# ---------------------------
-# Flask Web App
-# ---------------------------
+# Flask app
 app = Flask(__name__)
 
-# HTML Dashboard Template (enhanced version)
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🤖 IVASMS OTP Bot</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #f5f5f5; }
-        .card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
-        .stat { display: flex; justify-content: space-between; margin: 10px 0; font-size: 1.1em; }
-        .stat-label { color: #666; }
-        .stat-value { font-weight: bold; color: #4CAF50; }
-        .status-badge { display: inline-block; padding: 5px 10px; border-radius: 20px; font-size: 0.9em; }
-        .status-running { background: #d4edda; color: #155724; }
-        .status-stopped { background: #f8d7da; color: #721c24; }
-        .footer { margin-top: 30px; text-align: center; color: #999; font-size: 0.9em; }
-        button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 1em; }
-        button:hover { background: #45a049; }
-        .endpoints { margin-top: 20px; }
-        .endpoints a { color: #4CAF50; text-decoration: none; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>🤖 Telegram IVASMS OTP Bot</h1>
-        <p>Automated OTP monitoring and forwarding to Telegram.</p>
-        <div>
-            <span class="status-badge {{ 'status-running' if monitoring_active else 'status-stopped' }}">
-                {{ '🟢 Monitoring Active' if monitoring_active else '🔴 Monitoring Inactive' }}
-            </span>
-        </div>
-    </div>
+# Bot configuration
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+GROUP_ID = os.getenv('TELEGRAM_GROUP_ID')
+IVASMS_EMAIL = os.getenv('IVASMS_EMAIL')
+IVASMS_PASSWORD = os.getenv('IVASMS_PASSWORD')
 
-    <div class="card">
-        <h2>📊 Statistics</h2>
-        <div class="stat">
-            <span class="stat-label">Uptime:</span>
-            <span class="stat-value" id="uptime">{{ uptime }}</span>
-        </div>
-        <div class="stat">
-            <span class="stat-label">OTPs Sent:</span>
-            <span class="stat-value" id="otp_sent">{{ otp_sent }}</span>
-        </div>
-        <div class="stat">
-            <span class="stat-label">Last Check:</span>
-            <span class="stat-value" id="last_check">{{ last_check or 'Never' }}</span>
-        </div>
-        <div class="stat">
-            <span class="stat-label">Cache Size:</span>
-            <span class="stat-value" id="cache_size">{{ cache_size }}</span>
-        </div>
-    </div>
+# Bot statistics
+bot_stats = {
+    'start_time': datetime.now(),
+    'total_otps_sent': 0,
+    'last_check': 'Never',
+    'last_error': None,
+    'is_running': False
+}
 
-    <div class="card">
-        <h2>🛠️ Control & Testing</h2>
-        <p>Use these endpoints to test your bot:</p>
-        <ul class="endpoints">
-            <li><a href="/test-message" target="_blank">📨 Send Test Message</a> – Sends a dummy OTP to your Telegram group.</li>
-            <li><a href="/check-otp" target="_blank">🔍 Manual OTP Check</a> – Force a check for new OTPs now.</li>
-            <li><a href="/status" target="_blank">📈 JSON Status</a> – Raw status data.</li>
-        </ul>
-    </div>
+# Global bot instances
+bot = None
+telegram_app = None
+scraper = None
 
-    <div class="footer">
-        <p>Made with ❤️ for IVASMS users | <a href="https://github.com/ryyzxrv/telegram-ivasms-bot" target="_blank">GitHub</a></p>
-    </div>
+# Telegram Command Handlers
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    welcome_message = """🤖 <b>Telegram OTP Bot</b>
 
-    <script>
-        function updateStats() {
-            fetch('/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('uptime').innerText = data.uptime || '00:00:00';
-                    document.getElementById('otp_sent').innerText = data.otp_sent || 0;
-                    document.getElementById('last_check').innerText = data.last_check || 'Never';
-                    document.getElementById('cache_size').innerText = data.cache_size || 0;
-                })
-                .catch(err => console.error('Error updating stats:', err));
-        }
-        // Update every 5 seconds
-        setInterval(updateStats, 5000);
-        // Initial update
-        updateStats();
-    </script>
-</body>
-</html>
-"""
+🎯 <b>Available Commands:</b>
+/start - Show this help message
+/status - Show bot status and statistics
+/check - Manually check for new OTPs
+/test - Send a test OTP message
+/stats - Show detailed statistics
 
+🔐 <b>What I do:</b>
+• Monitor IVASMS.com for new OTPs
+• Send formatted OTPs to the group
+• Prevent duplicate notifications
+• Run 24/7 with automatic monitoring
+
+📊 <b>Current Status:</b>
+Bot is running and monitoring every 60 seconds.
+
+💡 <b>Need help?</b> Contact the bot administrator."""
+
+    await update.message.reply_text(welcome_message, parse_mode='HTML')
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command"""
+    uptime = datetime.now() - bot_stats['start_time']
+    uptime_str = str(uptime).split('.')[0]
+    
+    cache_stats = otp_filter.get_cache_stats()
+    
+    status_data = {
+        'uptime': uptime_str,
+        'total_otps_sent': bot_stats['total_otps_sent'],
+        'last_check': bot_stats['last_check'],
+        'cache_size': cache_stats['total_cached'],
+        'monitor_running': bot_stats['is_running']
+    }
+    
+    status_msg = get_status_message(status_data)
+    await update.message.reply_text(status_msg, parse_mode='HTML')
+
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /check command - manually check for OTPs"""
+    await update.message.reply_text("🔍 <b>Checking for new OTPs...</b>", parse_mode='HTML')
+    
+    try:
+        check_and_send_otps()
+        await update.message.reply_text(
+            "✅ <b>OTP check completed!</b>\n\n"
+            f"Last check: {bot_stats['last_check']}\n"
+            f"Total OTPs sent: {bot_stats['total_otps_sent']}",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ <b>Error during OTP check:</b>\n<code>{str(e)}</code>",
+            parse_mode='HTML'
+        )
+
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /test command - send test message"""
+    test_otp = {
+        'otp': '123456',
+        'phone': '+8801234567890',
+        'service': 'Test Service',
+        'timestamp': datetime.now().strftime('%H:%M:%S'),
+        'raw_message': 'This is a test OTP message from the bot'
+    }
+    
+    try:
+        test_message = format_otp_message(test_otp)
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=test_message,
+            parse_mode='HTML'
+        )
+        await update.message.reply_text(
+            "✅ <b>Test message sent to the group!</b>",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ <b>Failed to send test message:</b>\n<code>{str(e)}</code>",
+            parse_mode='HTML'
+        )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stats command - detailed statistics"""
+    uptime = datetime.now() - bot_stats['start_time']
+    uptime_str = str(uptime).split('.')[0]
+    
+    cache_stats = otp_filter.get_cache_stats()
+    
+    stats_message = f"""📊 <b>Detailed Bot Statistics</b>
+
+⏱️ <b>Runtime Information:</b>
+• Uptime: {uptime_str}
+• Started: {bot_stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}
+• Status: {'🟢 Running' if bot_stats['is_running'] else '🔴 Stopped'}
+
+📨 <b>OTP Statistics:</b>
+• Total OTPs Sent: {bot_stats['total_otps_sent']}
+• Last Check: {bot_stats['last_check']}
+• Cache Size: {cache_stats['total_cached']} items
+• Cache Expiry: {cache_stats['expire_minutes']} minutes
+
+🔧 <b>System Information:</b>
+• IVASMS Account: {IVASMS_EMAIL[:20]}...
+• Target Group: {GROUP_ID}
+• Check Interval: 60 seconds
+• Last Error: {bot_stats['last_error'] or 'None'}
+
+🌐 <b>Endpoints:</b>
+• Dashboard: Available
+• Manual Check: /check-otp
+• Status API: /status"""
+
+    await update.message.reply_text(stats_message, parse_mode='HTML')
+
+def initialize_bot():
+    """Initialize Telegram bot and scraper"""
+    global bot, telegram_app, scraper
+    
+    try:
+        if not BOT_TOKEN:
+            raise ValueError("TELEGRAM_BOT_TOKEN not found in environment variables")
+        
+        if not GROUP_ID:
+            raise ValueError("TELEGRAM_GROUP_ID not found in environment variables")
+        
+        if not IVASMS_EMAIL or not IVASMS_PASSWORD:
+            raise ValueError("IVASMS credentials not found in environment variables")
+        
+        # Initialize Telegram bot
+        bot = Bot(token=BOT_TOKEN)
+        
+        # Initialize Telegram application with command handlers
+        telegram_app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Add command handlers
+        telegram_app.add_handler(CommandHandler("start", start_command))
+        telegram_app.add_handler(CommandHandler("status", status_command))
+        telegram_app.add_handler(CommandHandler("check", check_command))
+        telegram_app.add_handler(CommandHandler("test", test_command))
+        telegram_app.add_handler(CommandHandler("stats", stats_command))
+        
+        logger.info("Telegram bot with commands initialized successfully")
+        
+        # Initialize scraper
+        scraper = create_scraper(IVASMS_EMAIL, IVASMS_PASSWORD)
+        if scraper:
+            logger.info("IVASMS scraper initialized successfully")
+        else:
+            logger.warning("Failed to initialize IVASMS scraper")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize bot: {e}")
+        bot_stats['last_error'] = str(e)
+        return False
+
+def send_telegram_message(message, parse_mode='HTML'):
+    """Send message to Telegram group"""
+    try:
+        if not bot or not GROUP_ID:
+            logger.error("Bot or Group ID not configured")
+            return False
+        
+        # Use asyncio to run the async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def send_message():
+            await bot.send_message(
+                chat_id=GROUP_ID,
+                text=message,
+                parse_mode=parse_mode
+            )
+        
+        loop.run_until_complete(send_message())
+        loop.close()
+        
+        logger.info("Message sent to Telegram successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to send Telegram message: {e}")
+        bot_stats['last_error'] = str(e)
+        return False
+
+def start_telegram_bot():
+    """Start the Telegram bot in a separate thread"""
+    if telegram_app:
+        logger.info("Starting Telegram command handlers...")
+        try:
+            # Run the bot in a separate thread
+            def run_bot():
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                telegram_app.run_polling(drop_pending_updates=True)
+            
+            bot_thread = threading.Thread(target=run_bot, daemon=True)
+            bot_thread.start()
+            logger.info("Telegram bot polling started")
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot polling: {e}")
+
+def check_and_send_otps():
+    """Check for new OTPs and send to Telegram"""
+    global bot_stats
+    
+    try:
+        if not scraper:
+            logger.error("Scraper not initialized")
+            return
+        
+        # Fetch messages from IVASMS
+        logger.info("Checking for new OTPs...")
+        messages = scraper.fetch_messages()
+        bot_stats['last_check'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        if not messages:
+            logger.info("No messages found")
+            return
+        
+        # Filter out duplicates
+        new_messages = otp_filter.filter_new_otps(messages)
+        
+        if not new_messages:
+            logger.info("No new OTPs found (all were duplicates)")
+            return
+        
+        logger.info(f"Found {len(new_messages)} new OTPs")
+        
+        # Send messages to Telegram
+        if len(new_messages) == 1:
+            message = format_otp_message(new_messages[0])
+        else:
+            message = format_multiple_otps(new_messages)
+        
+        if send_telegram_message(message):
+            bot_stats['total_otps_sent'] += len(new_messages)
+            logger.info(f"Successfully sent {len(new_messages)} OTPs to Telegram")
+        else:
+            logger.error("Failed to send OTPs to Telegram")
+        
+    except Exception as e:
+        logger.error(f"Error in check_and_send_otps: {e}")
+        bot_stats['last_error'] = str(e)
+
+def background_monitor():
+    """Background thread to monitor for OTPs"""
+    global bot_stats
+    
+    bot_stats['is_running'] = True
+    logger.info("Background OTP monitor started")
+    
+    while bot_stats['is_running']:
+        try:
+            check_and_send_otps()
+            # Wait 60 seconds before next check
+            time.sleep(60)
+            
+        except Exception as e:
+            logger.error(f"Error in background monitor: {e}")
+            bot_stats['last_error'] = str(e)
+            # Wait longer on error
+            time.sleep(120)
+
+# Flask routes
 @app.route('/')
-def index():
-    """Render the main dashboard."""
-    uptime_seconds = int(time.time() - start_time)
-    hours = uptime_seconds // 3600
-    minutes = (uptime_seconds % 3600) // 60
-    seconds = uptime_seconds % 60
-    uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+def home():
+    """Home route - serve dashboard or JSON based on Accept header"""
+    # Check if request wants HTML (browser) or JSON (API)
+    if 'text/html' in request.headers.get('Accept', ''):
+        # Serve HTML dashboard for browsers
+        return render_template('dashboard.html')
     
-    # Get cache size from scraper if available
-    cache_size = 0
-    if scraper and hasattr(scraper, 'get_cache_size'):
-        cache_size = scraper.get_cache_size()
+    # Serve JSON for API calls
+    uptime = datetime.now() - bot_stats['start_time']
+    uptime_str = str(uptime).split('.')[0]  # Remove microseconds
     
-    return render_template_string(
-        DASHBOARD_HTML,
-        uptime=uptime_str,
-        otp_sent=otp_sent_count,
-        last_check=last_check_time,
-        cache_size=cache_size,
-        monitoring_active=monitoring_active
-    )
-
-@app.route('/status')
-def status():
-    """Return JSON status for dashboard and API."""
-    uptime_seconds = int(time.time() - start_time)
-    hours = uptime_seconds // 3600
-    minutes = (uptime_seconds % 3600) // 60
-    seconds = uptime_seconds % 60
-    uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    
-    cache_size = 0
-    if scraper and hasattr(scraper, 'get_cache_size'):
-        cache_size = scraper.get_cache_size()
-    
-    return jsonify({
+    status = {
         'status': 'running',
         'uptime': uptime_str,
-        'otp_sent': otp_sent_count,
-        'last_check': last_check_time or 'Never',
-        'cache_size': cache_size,
-        'monitoring_active': monitoring_active,
-        'env_vars_loaded': not missing_vars
-    })
-
-@app.route('/test-message')
-def test_message():
-    """Send a test message to Telegram to verify connectivity."""
-    if not telegram_bot:
-        return "❌ Telegram bot not initialized. Check environment variables."
-    try:
-        test_otp = {
-            'otp': '123456',
-            'number': '+11234567890',
-            'service': 'Test Service',
-            'time': datetime.now().strftime('%H:%M:%S')
-        }
-        success = telegram_bot.send_otp(test_otp)
-        if success:
-            return "✅ Test message sent to Telegram. Check your group."
-        else:
-            return "❌ Failed to send test message. Check logs."
-    except Exception as e:
-        return f"❌ Error sending test message: {e}"
+        'total_otps_sent': bot_stats['total_otps_sent'],
+        'last_check': bot_stats['last_check'],
+        'last_error': bot_stats['last_error'],
+        'monitor_running': bot_stats['is_running']
+    }
+    
+    return jsonify(status)
 
 @app.route('/check-otp')
 def manual_check():
-    """Manually trigger an OTP check."""
-    global otp_sent_count, last_check_time
-    if not scraper or not telegram_bot:
-        return "❌ Scraper or bot not initialized."
+    """Manual OTP check endpoint"""
     try:
-        if not scraper.login():
-            return "❌ IVASMS login failed."
-        otps = scraper.check_otp()
-        count = 0
-        for otp in otps:
-            if telegram_bot.send_otp(otp):
-                otp_sent_count += 1
-                count += 1
-        last_check_time = datetime.now().isoformat()
-        return f"✅ Manual check completed. Found {len(otps)} OTPs, sent {count} new."
+        check_and_send_otps()
+        return jsonify({
+            'status': 'success',
+            'message': 'OTP check completed',
+            'timestamp': datetime.now().isoformat()
+        })
     except Exception as e:
-        return f"❌ Error during manual check: {e}"
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'timestamp': datetime.now().isoformat()
+        }), 500
 
-@app.route('/health')
-def health():
-    """Health check endpoint for uptime monitoring."""
-    return jsonify({'status': 'healthy'}), 200
+@app.route('/status')
+def bot_status():
+    """Get detailed bot status"""
+    uptime = datetime.now() - bot_stats['start_time']
+    uptime_str = str(uptime).split('.')[0]
+    
+    cache_stats = otp_filter.get_cache_stats()
+    
+    status = {
+        'uptime': uptime_str,
+        'total_otps_sent': bot_stats['total_otps_sent'],
+        'last_check': bot_stats['last_check'],
+        'cache_size': cache_stats['total_cached'],
+        'monitor_running': bot_stats['is_running']
+    }
+    
+    message = get_status_message(status)
+    
+    if request.args.get('send') == 'true':
+        # Send status to Telegram
+        if send_telegram_message(message):
+            return jsonify({'status': 'success', 'message': 'Status sent to Telegram'})
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to send status'}), 500
+    
+    return jsonify(status)
 
-# Record start time
-start_time = time.time()
+@app.route('/test-message')
+def test_message():
+    """Send test message to Telegram"""
+    test_msg = """🧪 <b>Test Message</b>
 
-# ---------------------------
-# Run Flask
-# ---------------------------
-if __name__ == '__main__':
+🔢 OTP: <code>123456</code>
+📱 Number: <code>+1234567890</code>
+🌐 Service: <b>Test Service</b>
+⏰ Time: Test Time
+
+<i>This is a test message from the bot!</i>"""
+    
+    if send_telegram_message(test_msg):
+        return jsonify({'status': 'success', 'message': 'Test message sent'})
+    else:
+        return jsonify({'status': 'error', 'message': 'Failed to send test message'}), 500
+
+@app.route('/clear-cache')
+def clear_cache():
+    """Clear OTP cache"""
+    try:
+        result = otp_filter.clear_cache()
+        return jsonify({'status': 'success', 'message': result})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/start-monitor')
+def start_monitor():
+    """Start background monitor"""
+    global bot_stats
+    
+    if bot_stats['is_running']:
+        return jsonify({'status': 'info', 'message': 'Monitor already running'})
+    
+    try:
+        monitor_thread = threading.Thread(target=background_monitor, daemon=True)
+        monitor_thread.start()
+        return jsonify({'status': 'success', 'message': 'Background monitor started'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/stop-monitor')
+def stop_monitor():
+    """Stop background monitor"""
+    global bot_stats
+    
+    bot_stats['is_running'] = False
+    return jsonify({'status': 'success', 'message': 'Background monitor stopped'})
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'status': 'error', 'message': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'status': 'error', 'message': 'Internal server error'}), 500
+
+def main():
+    """Main function to start the bot"""
+    logger.info("Starting Telegram OTP Bot...")
+    
+    # Initialize bot and scraper
+    if not initialize_bot():
+        logger.error("Failed to initialize bot. Check your configuration.")
+        return
+    
+    # Start Telegram command handlers
+    start_telegram_bot()
+    
+    # Send startup message
+    startup_message = """🚀 <b>Bot Started Successfully!</b>
+
+✅ IVASMS scraper initialized
+✅ Telegram bot connected
+✅ Command handlers active
+🔍 Monitoring for new OTPs...
+
+📋 <b>Available Commands:</b>
+/start - Show help and commands
+/status - Bot status
+/check - Manual OTP check
+/test - Send test message
+/stats - Detailed statistics
+
+<i>Bot is now running and will automatically send new OTPs to this group.</i>"""
+    
+    send_telegram_message(startup_message)
+    
+    # Start background monitor
+    monitor_thread = threading.Thread(target=background_monitor, daemon=True)
+    monitor_thread.start()
+    
+    # Get port for deployment
     port = int(os.environ.get('PORT', 5000))
-    # Note: debug=False is important for production
+    
+    logger.info(f"Starting Flask server on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
+if __name__ == '__main__':
+    main()
